@@ -6,6 +6,15 @@ import random
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+from io import BytesIO
+from typing import Deque, Dict, Optional
+
+try:  # Pillow is required for rendering the CAPTCHA challenges
+    from PIL import Image, ImageDraw, ImageFont
+except Exception:  # pragma: no cover - Pillow should be available but keep guard
+    Image = ImageDraw = ImageFont = None
+
+
 from typing import Deque, Dict, Optional
 
 from bot.logger_mesh import logger
@@ -83,6 +92,59 @@ class SecurityManager:
         return challenge
 
     @classmethod
+    def build_captcha_image(
+        cls, user_id: int, challenge: Optional[VerificationChallenge] = None
+    ) -> BytesIO:
+        """Return an image containing the CAPTCHA question."""
+
+        challenge = challenge or cls.ensure_challenge(user_id)
+
+        if Image is None:
+            raise RuntimeError("Pillow must be installed to generate verification CAPTCHA images.")
+
+        # Default dimensions chosen to work with Telegram's image preview sizes.
+        width, height = 420, 180
+        background_color = (247, 247, 247)
+        text_color = (20, 20, 20)
+
+        image = Image.new("RGB", (width, height), background_color)
+        draw = ImageDraw.Draw(image)
+
+        try:
+            font = ImageFont.truetype("arial.ttf", 64)
+        except Exception:
+            font = ImageFont.load_default()
+
+        text = challenge.question
+        bbox = draw.textbbox((0, 0), text, font=font)
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+        x = (width - text_width) / 2
+        y = (height - text_height) / 2
+        draw.text((x, y), text, font=font, fill=text_color)
+
+        # Add minimal noise so automated bots struggle while humans can read easily.
+        for _ in range(5):
+            x1 = random.randint(0, width)
+            y1 = random.randint(0, height)
+            x2 = random.randint(0, width)
+            y2 = random.randint(0, height)
+            draw.line((x1, y1, x2, y2), fill=(160, 160, 160), width=2)
+
+        for _ in range(80):
+            dot_x = random.randint(0, width - 1)
+            dot_y = random.randint(0, height - 1)
+            draw.point((dot_x, dot_y), fill=(200, 200, 200))
+
+        buffer = BytesIO()
+        image.save(buffer, format="PNG")
+        buffer.seek(0)
+        buffer.name = "captcha.png"
+        return buffer
+
+
+    @classmethod
+
     def submit_captcha(cls, user_id: int, answer: str) -> bool:
         challenge = cls._user_challenges.get(user_id)
         if not challenge:

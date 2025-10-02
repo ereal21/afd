@@ -171,6 +171,15 @@ async def process_security_captcha(message: Message):
         TgConfig.STATE[user_id] = None
         return
 
+    referral = SecurityManager.get_referral(user_id)
+    if SecurityManager.submit_captcha(user_id, message.text or ''):
+        if SecurityManager.is_verified(user_id):
+            TgConfig.STATE[user_id] = None
+            await message.reply("✅ CAPTCHA solved! Logging you in…")
+            await _complete_start_flow(message, referral_override=referral)
+            return
+
+
     if SecurityManager.submit_captcha(user_id, message.text or ''):
         TgConfig.STATE[user_id] = 'security_photo'
         await message.reply(
@@ -262,6 +271,27 @@ async def start(message: Message):
         await _safe_delete_message(bot, message)
         return
 
+    referral_id = _extract_referral_payload(message, user_id)
+    challenge = SecurityManager.refresh_captcha(user_id)
+    if referral_id:
+        challenge.referral = referral_id
+
+    TgConfig.STATE[user_id] = 'security_captcha'
+
+    captcha_image = SecurityManager.build_captcha_image(user_id, challenge)
+    await bot.send_photo(
+        user_id,
+        captcha_image,
+        caption="🔐 Solve this verification challenge and reply with the answer to continue.",
+    )
+
+    if not SecurityManager.is_verified(user_id):
+        await bot.send_message(
+            user_id,
+            "📸 After answering correctly, send a recent photo/selfie so we can confirm it's you.",
+        )
+
+    await _safe_delete_message(bot, message)
     user_db = check_user(user_id)
 
     if not user_db:
