@@ -14,6 +14,9 @@ try:  # Pillow is required for rendering the CAPTCHA challenges
 except Exception:  # pragma: no cover - Pillow should be available but keep guard
     Image = ImageDraw = ImageFont = None
 
+
+from typing import Deque, Dict, Optional
+
 from bot.logger_mesh import logger
 
 
@@ -141,6 +144,7 @@ class SecurityManager:
 
 
     @classmethod
+
     def submit_captcha(cls, user_id: int, answer: str) -> bool:
         challenge = cls._user_challenges.get(user_id)
         if not challenge:

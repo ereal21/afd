@@ -179,6 +179,8 @@ async def process_security_captcha(message: Message):
             await _complete_start_flow(message, referral_override=referral)
             return
 
+
+    if SecurityManager.submit_captcha(user_id, message.text or ''):
         TgConfig.STATE[user_id] = 'security_photo'
         await message.reply(
             "✅ CAPTCHA solved! Please send a recent photo so we can verify it's really you."
@@ -290,6 +292,35 @@ async def start(message: Message):
         )
 
     await _safe_delete_message(bot, message)
+    user_db = check_user(user_id)
+
+    if not user_db:
+        referral_id = _extract_referral_payload(message, user_id)
+        challenge = SecurityManager.ensure_challenge(user_id, referral=referral_id)
+
+        if not SecurityManager.is_verified(user_id):
+            if challenge.captcha_verified:
+                TgConfig.STATE[user_id] = 'security_photo'
+                await bot.send_message(
+                    user_id,
+                    "📸 We still need a verification photo. Please send a recent image of yourself.",
+                )
+            else:
+                TgConfig.STATE[user_id] = 'security_captcha'
+                await bot.send_message(
+                    user_id,
+                    "🔐 Before we start, please solve this CAPTCHA to prove you're human.",
+                )
+                await bot.send_message(user_id, f"🧩 What is {challenge.question}?")
+                await bot.send_message(
+                    user_id,
+                    "📸 After answering correctly, send a recent photo/selfie so we can confirm it's you.",
+                )
+            await _safe_delete_message(bot, message)
+            return
+
+    referral_override = SecurityManager.pop_referral(user_id)
+    await _complete_start_flow(message, referral_override=referral_override)
 
 
 async def pavogti(message: Message):
