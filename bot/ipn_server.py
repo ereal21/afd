@@ -18,6 +18,7 @@ from bot.database.methods import (
     get_user_language,
 )
 from bot.logger_mesh import logger
+from bot.utils.security import SecurityManager
 
 app = Flask(__name__)
 
@@ -38,15 +39,36 @@ def verify_signature(data: bytes, signature: str | None) -> bool:
 @app.route("/nowpayments-ipn", methods=["POST"])
 @app.route("/", methods=["POST"])  # fallback if IPN path omitted
 def nowpayments_ipn():
+    SecurityManager.cleanup()
+    ip_addr = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown")
+    if "," in ip_addr:
+        ip_addr = ip_addr.split(",", 1)[0].strip()
+
+    if SecurityManager.is_ip_blocked(ip_addr):
+        logger.warning("Blocked IP %s attempted to access %s", ip_addr, request.path)
+        abort(429)
+
+    allowed, reason = SecurityManager.record_ip_request(ip_addr)
+    if not allowed:
+        logger.warning(
+            "Rate limiting %s for %s due to %s", ip_addr, request.path, reason
+        )
+        if reason == "anomaly":
+            SecurityManager.record_ip_failure(ip_addr, "anomalous_activity")
+        return "", 429
+
     if not verify_signature(request.data, request.headers.get("x-nowpayments-sig")):
+        SecurityManager.record_ip_failure(ip_addr, "invalid_signature")
         abort(400)
 
     # try to parse JSON regardless of Content-Type header
     data = request.get_json(force=True, silent=True) or {}
-    payment_id = str(data.get("payment_id"))
+    payment_id_raw = data.get("payment_id")
     status = data.get("payment_status")
-    if not payment_id or not status:
+    if not payment_id_raw or not status:
+        SecurityManager.record_ip_failure(ip_addr, "missing_fields")
         return "", 400
+    payment_id = str(payment_id_raw)
 
     if status in ("finished", "confirmed", "sending", "paid", "partially_paid"):
         session = Database().session
@@ -70,7 +92,10 @@ def nowpayments_ipn():
                 update_balance(referral_id, referral_operation)
 
             logger.info(
-                "NOWPayments IPN confirmed payment %s for user %s", payment_id, user_id
+                "NOWPayments IPN confirmed payment %s for user %s from %s",
+                payment_id,
+                user_id,
+                ip_addr,
             )
 
             # notify user and delete invoice
@@ -87,4 +112,5 @@ def nowpayments_ipn():
                     reply_markup=markup,
                 )
             )
+    logger.info("Processed IPN callback %s from %s with status %s", payment_id, ip_addr, status)
     return "", 200

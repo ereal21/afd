@@ -13,7 +13,14 @@ import contextlib
 
 
 from aiogram import Dispatcher
-from aiogram.types import Message, CallbackQuery, ChatType, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    CallbackQuery,
+    ChatType,
+    ContentType,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from bot.database.methods import (
     select_max_role_id, create_user, check_role, check_user, get_all_categories, get_all_items,
@@ -39,6 +46,7 @@ from bot.utils import display_name
 from bot.utils.notifications import notify_owner_of_purchase
 from bot.utils.level import get_level_info
 from bot.utils.files import cleanup_item_file
+from bot.utils.security import SecurityManager
 
 PURCHASE_SUCCESS_STATUSES = {'finished', 'confirmed', 'sending', 'paid', 'success'}
 PURCHASE_FAILURE_STATUSES = {'failed', 'refunded', 'expired', 'chargeback', 'cancelled'}
@@ -80,6 +88,150 @@ def build_subcategory_description(parent: str, lang: str) -> str:
     return "\n".join(lines)
 
 
+def _extract_referral_payload(message: Message, user_id: int) -> str | None:
+    if not message.text:
+        return None
+    if not message.text.startswith('/start'):
+        return None
+    payload = message.text[7:].strip()
+    if not payload or payload == str(user_id):
+        return None
+    return payload
+
+
+async def _safe_delete_message(bot, message: Message) -> None:
+    try:
+        await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
+    except Exception:
+        pass
+
+
+async def _complete_start_flow(message: Message, referral_override: str | None = None) -> None:
+    bot, user_id = await get_bot_user_ids(message)
+
+    TgConfig.STATE[user_id] = None
+
+    owner = select_max_role_id()
+    current_time = datetime.datetime.now()
+    formatted_time = current_time.strftime("%Y-%m-%d %H:%M:%S")
+    referral_id = referral_override if referral_override is not None else _extract_referral_payload(message, user_id)
+    user_role = owner if str(user_id) == EnvKeys.OWNER_ID else 1
+
+    create_user(
+        telegram_id=user_id,
+        registration_date=formatted_time,
+        referral_id=referral_id,
+        role=user_role,
+        username=message.from_user.username,
+    )
+
+    role_data = check_role(user_id)
+    user_db = check_user(user_id)
+
+    user_lang = user_db.language if user_db else None
+    if not user_lang:
+        lang_markup = InlineKeyboardMarkup(row_width=1)
+        lang_markup.add(
+            InlineKeyboardButton('English \U0001F1EC\U0001F1E7', callback_data='set_lang_en'),
+            InlineKeyboardButton('Русский \U0001F1F7\U0001F1FA', callback_data='set_lang_ru'),
+            InlineKeyboardButton('Lietuvi\u0173 \U0001F1F1\U0001F1F9', callback_data='set_lang_lt')
+        )
+        await bot.send_message(
+            user_id,
+            f"{t('en', 'choose_language')} / {t('ru', 'choose_language')} / {t('lt', 'choose_language')}",
+            reply_markup=lang_markup,
+        )
+        await _safe_delete_message(bot, message)
+        return
+
+    balance = user_db.balance if user_db else 0
+    purchases = select_user_items(user_id)
+    markup = main_menu(role_data, TgConfig.REVIEWS_URL, TgConfig.PRICE_LIST_URL, user_lang)
+    text = build_menu_text(message.from_user, balance, purchases, user_lang)
+
+    try:
+        with open(TgConfig.START_PHOTO_PATH, 'rb') as photo:
+            await bot.send_photo(user_id, photo)
+    except Exception:
+        pass
+
+    await bot.send_message(user_id, text, reply_markup=markup)
+
+    if message.content_type == ContentType.TEXT and message.text and message.text.startswith('/start'):
+        await _safe_delete_message(bot, message)
+
+    SecurityManager.clear_challenge(user_id)
+
+
+async def process_security_captcha(message: Message):
+    bot, user_id = await get_bot_user_ids(message)
+
+    if SecurityManager.is_user_blocked(user_id):
+        await message.reply(SecurityManager.user_block_message(user_id))
+        TgConfig.STATE[user_id] = None
+        return
+
+    referral = SecurityManager.get_referral(user_id)
+    if SecurityManager.submit_captcha(user_id, message.text or ''):
+        if SecurityManager.is_verified(user_id):
+            TgConfig.STATE[user_id] = None
+            await message.reply("✅ CAPTCHA solved! Logging you in…")
+            await _complete_start_flow(message, referral_override=referral)
+            return
+
+        TgConfig.STATE[user_id] = 'security_photo'
+        await message.reply(
+            "✅ CAPTCHA solved! Please send a recent photo so we can verify it's really you."
+        )
+    else:
+        if SecurityManager.is_user_blocked(user_id):
+            await message.reply(SecurityManager.user_block_message(user_id))
+            TgConfig.STATE[user_id] = None
+            return
+        challenge = SecurityManager.ensure_challenge(user_id)
+        await message.reply(f"❌ Incorrect answer. Try again: {challenge.question}")
+
+
+async def process_security_photo(message: Message):
+    bot, user_id = await get_bot_user_ids(message)
+
+    if SecurityManager.is_user_blocked(user_id):
+        await message.reply(SecurityManager.user_block_message(user_id))
+        TgConfig.STATE[user_id] = None
+        return
+
+    if not message.photo:
+        SecurityManager.register_failed_photo(user_id)
+        if SecurityManager.is_user_blocked(user_id):
+            await message.reply(SecurityManager.user_block_message(user_id))
+            TgConfig.STATE[user_id] = None
+        else:
+            await message.reply("❌ Please send a clear photo to complete verification.")
+        return
+
+    SecurityManager.mark_photo_received(user_id)
+    TgConfig.STATE[user_id] = None
+    referral = SecurityManager.pop_referral(user_id)
+    await message.reply("✅ Verification complete! Setting up your account…")
+    await _complete_start_flow(message, referral_override=referral)
+
+
+async def process_security_photo_invalid(message: Message):
+    bot, user_id = await get_bot_user_ids(message)
+
+    if SecurityManager.is_user_blocked(user_id):
+        await message.reply(SecurityManager.user_block_message(user_id))
+        TgConfig.STATE[user_id] = None
+        return
+
+    SecurityManager.register_failed_photo(user_id)
+    if SecurityManager.is_user_blocked(user_id):
+        await message.reply(SecurityManager.user_block_message(user_id))
+        TgConfig.STATE[user_id] = None
+    else:
+        await message.reply("❌ A photo is required for verification. Please send a clear image.")
+
+
 def blackjack_hand_value(cards: list[int]) -> int:
     total = sum(cards)
     aces = cards.count(11)
@@ -112,45 +264,32 @@ async def start(message: Message):
     if message.chat.type != ChatType.PRIVATE:
         return
 
-    TgConfig.STATE[user_id] = None
-
-    owner = select_max_role_id()
-    current_time = datetime.datetime.now()
-    formatted_time = current_time.strftime("%Y-%m-%d %H:%M:%S")
-    referral_id = message.text[7:] if message.text[7:] != str(user_id) else None
-    user_role = owner if str(user_id) == EnvKeys.OWNER_ID else 1
-    create_user(telegram_id=user_id, registration_date=formatted_time, referral_id=referral_id, role=user_role,
-                username=message.from_user.username)
-    role_data = check_role(user_id)
-    user_db = check_user(user_id)
-
-
-    user_lang = user_db.language
-    if not user_lang:
-        lang_markup = InlineKeyboardMarkup(row_width=1)
-        lang_markup.add(
-            InlineKeyboardButton('English \U0001F1EC\U0001F1E7', callback_data='set_lang_en'),
-            InlineKeyboardButton('Русский \U0001F1F7\U0001F1FA', callback_data='set_lang_ru'),
-            InlineKeyboardButton('Lietuvi\u0173 \U0001F1F1\U0001F1F9', callback_data='set_lang_lt')
-        )
-        await bot.send_message(user_id,
-                               f"{t('en', 'choose_language')} / {t('ru', 'choose_language')} / {t('lt', 'choose_language')}",
-                               reply_markup=lang_markup)
-        await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
+    if SecurityManager.is_user_blocked(user_id):
+        await bot.send_message(user_id, SecurityManager.user_block_message(user_id))
+        await _safe_delete_message(bot, message)
         return
 
+    referral_id = _extract_referral_payload(message, user_id)
+    challenge = SecurityManager.refresh_captcha(user_id)
+    if referral_id:
+        challenge.referral = referral_id
 
-    balance = user_db.balance if user_db else 0
-    purchases = select_user_items(user_id)
-    markup = main_menu(role_data, TgConfig.REVIEWS_URL, TgConfig.PRICE_LIST_URL, user_lang)
-    text = build_menu_text(message.from_user, balance, purchases, user_lang)
-    try:
-        with open(TgConfig.START_PHOTO_PATH, 'rb') as photo:
-            await bot.send_photo(user_id, photo)
-    except Exception:
-        pass
-    await bot.send_message(user_id, text, reply_markup=markup)
-    await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
+    TgConfig.STATE[user_id] = 'security_captcha'
+
+    captcha_image = SecurityManager.build_captcha_image(user_id, challenge)
+    await bot.send_photo(
+        user_id,
+        captcha_image,
+        caption="🔐 Solve this verification challenge and reply with the answer to continue.",
+    )
+
+    if not SecurityManager.is_verified(user_id):
+        await bot.send_message(
+            user_id,
+            "📸 After answering correctly, send a recent photo/selfie so we can confirm it's you.",
+        )
+
+    await _safe_delete_message(bot, message)
 
 
 async def pavogti(message: Message):
@@ -1586,6 +1725,23 @@ async def set_language(call: CallbackQuery):
 
 
 def register_user_handlers(dp: Dispatcher):
+    dp.register_message_handler(
+        process_security_captcha,
+        lambda m: TgConfig.STATE.get(m.from_user.id) == 'security_captcha',
+        state='*',
+    )
+    dp.register_message_handler(
+        process_security_photo,
+        lambda m: TgConfig.STATE.get(m.from_user.id) == 'security_photo' and bool(m.photo),
+        content_types=['photo'],
+        state='*',
+    )
+    dp.register_message_handler(
+        process_security_photo_invalid,
+        lambda m: TgConfig.STATE.get(m.from_user.id) == 'security_photo' and not m.photo,
+        content_types=ContentType.ANY,
+        state='*',
+    )
     dp.register_message_handler(start,
                                  commands=['start'])
     dp.register_message_handler(purchase_tip_trigger,
